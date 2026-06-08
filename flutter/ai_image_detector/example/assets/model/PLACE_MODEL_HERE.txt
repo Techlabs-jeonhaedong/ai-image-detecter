@@ -1,0 +1,13 @@
+# 모델 파일 위치 안내
+
+.onnx와 meta.json 파일을 이 디렉토리에 넣으세요.
+
+변환 방법:
+  python convert_to_onnx.py --model Organika/sdxl-detector
+
+생성된 파일:
+  onnx_models/Organika__sdxl-detector/model.onnx (또는 model_quantized.onnx)
+  onnx_models/Organika__sdxl-detector/meta.json
+
+→ 이 두 파일을 flutter/ai_image_detector/example/assets/model/ 에 복사하세요.
+

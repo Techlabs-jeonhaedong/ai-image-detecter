@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# HuggingFace 모델 캐시 (로컬 다운로드)
+.cache/
+
+# ONNX 변환 산출물 (convert_to_onnx.py 결과, 용량 큼)
+onnx_models/
+
+# Flutter 빌드 산출물 / 패키지 캐시
+flutter/**/build/
+flutter/**/.dart_tool/
+flutter/**/.flutter-plugins
+flutter/**/.flutter-plugins-dependencies
+flutter/**/pubspec.lock
+# 번들 모델 파일 (변환 후 수동 복사, 용량 큼)
+flutter/**/assets/model/*.onnx
+flutter/**/assets/model/*.json
+
+# OS
+.DS_Store

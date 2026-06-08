@@ -1,0 +1,7 @@
+# 핵심 의존성
+# torch 2.2.2, transformers 4.47.1, Pillow 10.3.0 는 anaconda3 환경에 이미 설치됨
+# 아래는 혹시 누락된 경우를 위해 명시
+
+torch>=2.0.0
+transformers>=4.40.0
+Pillow>=9.0.0

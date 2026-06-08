@@ -1,0 +1,5 @@
+# 경량 ONNX Runtime 추론 의존성 (torch/transformers 불필요)
+# onnxruntime ABI 호환 범위: numpy<2.0 필수
+onnxruntime>=1.16.0,<2.0.0
+numpy>=1.24.0,<2.0.0
+Pillow>=9.0.0,<12.0.0
