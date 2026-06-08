@@ -552,6 +552,118 @@ uvicorn server:app --host 127.0.0.1 --port 8000 --workers 2
 
 ---
 
+## Python API 직접 사용 (bytes/파일 스트림)
+
+서버 없이 Python 코드에서 `detect()` 함수를 import해 파일 경로뿐 아니라 **파일 바이트나 스트림을 그대로** 전달할 수 있다. 업로드된 파일을 디스크에 임시저장하지 않고 메모리에서 바로 처리할 때 유용하다.
+
+### 기본 사용 (bytes)
+
+```python
+from detector import detect
+
+# 파일 바이트를 직접 전달 (디스크 임시저장 불필요)
+with open("photo.jpg", "rb") as f:
+    image_bytes = f.read()
+
+result = detect(image_bytes, name="photo.jpg")
+
+print(result["verdict"])          # "AI-generated" 또는 "Real"
+print(result["ai_probability"])   # 0.0 ~ 1.0
+print(result["verdict_source"])   # "model" 또는 "metadata"
+```
+
+### 웹 프레임워크 연동 (FastAPI / Django / Flask)
+
+```python
+# FastAPI — UploadFile을 디스크 임시저장 없이 처리
+from fastapi import FastAPI, UploadFile, File
+from detector import detect
+
+app = FastAPI()
+
+@app.post("/analyze")
+async def analyze_image(file: UploadFile = File(...)):
+    content = await file.read()                      # 메모리에서 읽기
+    result = detect(content, name=file.filename)     # bytes 직접 전달
+    return result
+```
+
+### 앙상블 + 메타데이터
+
+```python
+from detector import detect
+
+with open("sd_image.png", "rb") as f:
+    data = f.read()
+
+result = detect(
+    data,
+    name="sd_image.png",
+    ensemble=True,       # 앙상블 모델 세트 사용
+    threshold=0.6,       # 더 엄격한 임계값
+    with_metadata=True,  # 메타데이터 AI 신호 검사 (기본 True)
+)
+
+print(result["verdict"])        # SD params 있으면 "AI-generated"
+print(result["verdict_source"]) # "metadata" (결정적 신호 기반 override)
+print(result["metadata"]["signals"])  # 탐지된 신호 목록
+```
+
+### 파일 경로 입력도 동일하게 동작 (하위호환)
+
+```python
+from detector import detect
+
+result = detect("photo.jpg")       # 기존 경로 입력도 그대로 사용 가능
+result = detect("photo.jpg", ensemble=True, threshold=0.7)
+```
+
+### io.BytesIO / 파일 핸들
+
+```python
+import io
+from detector import detect
+
+# BytesIO 스트림 전달
+data = b"..."  # 이미지 바이트
+result = detect(io.BytesIO(data), name="stream.jpg")
+
+# 파일 핸들 전달 (seek이 가능한 바이너리 스트림)
+with open("photo.jpg", "rb") as f:
+    result = detect(f, name="photo.jpg")
+```
+
+> **중요: file-like 스트림은 1회만 사용 가능** — `detect()`와 `analyze_images_batch()`의
+> 진입부에서 `_normalize_source()`를 통해 file-like를 1회 `read()`로 bytes로 변환한다.
+> 따라서 같은 스트림 객체를 여러 번 전달하면 두 번째 호출부터는 빈 bytes가 된다.
+> 동일 데이터를 여러 번 처리하려면 bytes를 직접 전달하거나 매번 새 `BytesIO`를 생성할 것.
+
+### bytes/file-like 입력 시 C2PA 정식 검증의 한계
+
+`inspect_metadata()`는 bytes나 file-like 입력을 받을 때 **`c2pa-python` 라이브러리의 정식 매니페스트 검증을 수행하지 않는다**. `c2pa.Reader.from_file()` API가 파일 경로만 지원하기 때문이다.
+
+- 파일 경로(str) 입력: Pillow 기반 탐지 + raw bytes 스캔 + **c2pa-python 정식 검증** (c2pa-python 설치 시)
+- bytes / file-like 입력: Pillow 기반 탐지 + raw bytes 스캔만 수행 (**c2pa 정식 검증 skip**)
+
+> raw bytes 스캔(XMP 패킷, JUMBF 시그니처, AI 도구명 직접 탐지)은 bytes 입력에서도 동작한다.
+> c2pa 정식 검증이 필요한 경우에는 파일 경로(str)로 전달할 것.
+
+### 서버가 임시파일 없이 처리한다는 보장
+
+`/detect` HTTP 엔드포인트는 업로드된 파일을 디스크 임시파일로 저장하지 않고 메모리 bytes로 직접 처리한다. `tempfile.mkstemp`가 호출되지 않으며, 요청 처리 후 디스크에 파일이 남지 않는다.
+
+```bash
+# 서버 실행
+uvicorn server:app --host 127.0.0.1 --port 8000
+
+# 업로드 (임시파일 없이 메모리에서 바로 처리됨)
+curl -F "file=@photo.jpg" http://127.0.0.1:8000/detect
+```
+
+응답의 `"image"` 필드는 업로드 파일의 원본 파일명(`file.filename`)으로 채워진다.
+
+---
+
 ## 경량 모드 (ONNX Runtime)
 
 ### 왜 경량인가?
@@ -567,6 +679,38 @@ uvicorn server:app --host 127.0.0.1 --port 8000 --workers 2
 > **주의**: INT8 dynamic quantization은 모델에 따라 정확도가 소폭 하락할 수 있다. 정밀도가 중요하면 `--no-quantize` 옵션으로 변환 후 사용하거나 torch 백엔드를 유지할 것.
 
 ### 1단계: 모델 변환 (빌드/개발 머신에서 1회)
+
+#### 권장: `setup.py` 빌드 스크립트 사용
+
+> **`setup.py`는 setuptools 패키징 파일이 아닌 독립 빌드 스크립트다.** `pip install -e`와 무관하며 `python setup.py ...` 형태로 직접 실행한다.
+
+```bash
+# 변환 전용 의존성 설치 + 기본 모델 변환 + self-test (한 번에)
+python setup.py
+
+# 의존성 이미 설치된 경우 (재변환 시 빠름)
+python setup.py --skip-install
+
+# 저장 디렉토리 지정
+python setup.py --output-dir /opt/onnx_models
+
+# 여러 모델 한 번에 변환
+python setup.py Organika/sdxl-detector umm-maybe/AI-image-detector
+
+# 도움말
+python setup.py --help
+```
+
+`setup.py`는 다음을 자동으로 수행한다:
+1. 의존성 설치 (`requirements-convert.txt`)
+2. ONNX export + `meta.json` 생성 (`convert_to_onnx.py --no-quantize` 재사용)
+3. stale `model_quantized.onnx` 제거 (멱등성 보장)
+4. **MatMul-only INT8 양자화** (`op_types_to_quantize=['MatMul']` — Conv 제외로 ConvInteger 생성 차단)
+5. self-test: ConvInteger 0개 확인 + CPUExecutionProvider 로드 + 더미 추론
+
+> **왜 `setup.py`를 쓰는가**: `convert_to_onnx.py`의 기본 양자화(`--quantize-arch portable`)는 Conv까지 양자화해 ConvInteger 노드를 생성한다. onnxruntime CPU EP는 ConvInteger를 미구현(NOT_IMPLEMENTED)으로 처리해 **모든 플랫폼에서 세션 로드가 실패**한다. `setup.py`는 MatMul만 양자화해 이 문제를 회피하며, 크기도 337MB → 91MB로 줄어든다.
+
+#### 개별 스크립트 사용 (세밀한 제어가 필요한 경우)
 
 ```bash
 # 변환 전용 의존성 설치 (torch, transformers, optimum 포함)
