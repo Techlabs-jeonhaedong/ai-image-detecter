@@ -6,12 +6,64 @@ detect.py와 server.py에서 공유하는 _get_backend_pipeline_fn 로직을 한
 """
 import os
 import sys
-from typing import Callable
+from typing import Callable, List, Optional
 
 # 기본 ONNX 모델 디렉토리 — 이 파일 기준 절대경로 (어느 cwd에서 실행해도 동일)
 DEFAULT_ONNX_MODELS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "onnx_models"
 )
+
+
+def resolve_ensemble_models_for_onnx(
+    ensemble_models: List[str],
+    explicit_models: List[str],
+    *,
+    backend: str,
+    onnx_models_dir: str,
+    is_mock: bool,
+    warn,  # callable(str) | None — 제외 경고 메시지 수신 콜백
+) -> List[str]:
+    """
+    세 진입점(detect.py, detector.detect(), server.py)이 공유하는 ensemble 필터 헬퍼.
+
+    정책:
+    - backend != "onnx" 또는 is_mock=True 이면 필터 없이 ensemble + explicit 병합만 한다.
+    - backend == "onnx" + is_mock=False 이면:
+        * ensemble_models 중 미번들(is_model_available=False)을 제외하고 warn 콜백 호출.
+        * explicit_models 는 번들 여부와 무관하게 절대 자동 제외하지 않는다.
+    - 반환값은 중복 제거·순서 유지된 최종 model_ids 리스트.
+
+    Args:
+        ensemble_models: --ensemble 에서 비롯된 모델 ID 목록 (ENSEMBLE_MODELS 서브셋)
+        explicit_models: --model / models= 로 사용자가 명시한 모델 ID 목록
+        backend: "onnx" 또는 "torch" (대소문자 정규화 없이 사용)
+        onnx_models_dir: ONNX 모델 베이스 디렉토리
+        is_mock: _AI_DETECTOR_MOCK=1 환경 여부
+        warn: 제외 경고 메시지를 받는 콜백. None이면 무시.
+
+    Returns:
+        중복 제거·순서 유지된 최종 model_ids 리스트.
+    """
+    normalized_backend = backend.strip().lower()
+    available_ensemble = list(ensemble_models)
+
+    if normalized_backend == "onnx" and not is_mock and ensemble_models:
+        from onnx_detector import is_model_available
+        unavailable = [m for m in ensemble_models if not is_model_available(m, onnx_models_dir)]
+        if unavailable and warn is not None:
+            names = ", ".join(unavailable)
+            warn(
+                f"WARNING: 다음 ensemble 모델이 onnx 번들에 없음; "
+                f"--backend torch 또는 setup.py로 변환 필요: {names}"
+            )
+        available_ensemble = [m for m in ensemble_models if m not in unavailable]
+
+    # 중복 제거·순서 유지: ensemble 가용 목록 먼저, explicit 추가
+    result: List[str] = list(available_ensemble)
+    for m in explicit_models:
+        if m not in result:
+            result.append(m)
+    return result
 
 
 def get_backend_pipeline_fn(

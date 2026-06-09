@@ -88,21 +88,25 @@ def is_model_available(model_id: str, onnx_models_dir: str) -> bool:
     model_id에 해당하는 ONNX 모델이 onnx_models_dir에 번들돼 있는지 확인한다.
 
     안전하지 않은 model_id(path traversal 시도 등)이거나 모델 디렉토리가 없거나
-    .onnx 파일이 없으면 False를 반환한다. 예외를 던지지 않는다.
+    .onnx 파일 또는 meta.json이 없으면 False를 반환한다. 예외를 던지지 않는다.
 
     Args:
         model_id: HuggingFace 모델 ID (예: "Organika/sdxl-detector")
         onnx_models_dir: ONNX 모델 베이스 디렉토리
 
     Returns:
-        bool — True이면 번들 존재, False이면 미존재 또는 안전하지 않은 id
+        bool — True이면 번들 존재(.onnx + meta.json 둘 다), False이면 미존재 또는 안전하지 않은 id
     """
     try:
         model_dir = _validate_model_path(model_id, onnx_models_dir)
-    except (ValueError, Exception):
+    except Exception:
         return False
 
     if not os.path.isdir(model_dir):
+        return False
+
+    # meta.json이 반드시 있어야 한다
+    if not os.path.isfile(os.path.join(model_dir, "meta.json")):
         return False
 
     # .onnx 파일이 하나라도 있어야 한다

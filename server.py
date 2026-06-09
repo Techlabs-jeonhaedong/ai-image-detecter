@@ -204,15 +204,27 @@ def detect_endpoint(
         raise HTTPException(status_code=400, detail="Uploaded file is empty (0 bytes)")
 
     # ── 모델 목록 결정 ───────────────────────────────────────────────────
-    # 빈 문자열/공백 필터링 및 중복 제거
-    model_ids: List[str] = []
-    if ensemble:
-        model_ids.extend(ENSEMBLE_MODELS)
+    from backends import resolve_ensemble_models_for_onnx, DEFAULT_ONNX_MODELS_DIR
+    _is_mock = os.environ.get("_AI_DETECTOR_MOCK") == "1"
+    _backend = os.environ.get("DETECTOR_BACKEND", "onnx")
+    _onnx_dir = os.environ.get("ONNX_MODELS_DIR", DEFAULT_ONNX_MODELS_DIR)
+
+    ensemble_model_ids: List[str] = list(ENSEMBLE_MODELS) if ensemble else []
+    explicit_model_ids: List[str] = []
     if model:
         for m in model:
             stripped = m.strip()
-            if stripped and stripped not in model_ids:
-                model_ids.append(stripped)
+            if stripped and stripped not in explicit_model_ids:
+                explicit_model_ids.append(stripped)
+
+    model_ids = resolve_ensemble_models_for_onnx(
+        ensemble_models=ensemble_model_ids,
+        explicit_models=explicit_model_ids,
+        backend=_backend,
+        onnx_models_dir=_onnx_dir,
+        is_mock=_is_mock,
+        warn=lambda msg: logger.warning(msg),
+    )
     if not model_ids:
         model_ids = [DEFAULT_MODEL]
 

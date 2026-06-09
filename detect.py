@@ -129,38 +129,28 @@ def _resolve_models(args) -> list:
       --model로 명시된 모델은 제외하지 않는다 (사용자 의도 보존).
     """
     from detector import ENSEMBLE_MODELS
+    from backends import resolve_ensemble_models_for_onnx
 
-    ensemble_models = []
+    ensemble_models = list(ENSEMBLE_MODELS) if args.ensemble else []
+
     explicit_models = []
-
-    if args.ensemble:
-        ensemble_models.extend(ENSEMBLE_MODELS)
-
     if args.models:
         for m in args.models:
-            if m not in ensemble_models and m not in explicit_models:
+            if m not in explicit_models:
                 explicit_models.append(m)
 
-    # onnx 백엔드 + 비mock 환경: ensemble 유래 모델만 필터링
     backend = getattr(args, "backend", "onnx")
     is_mock = os.environ.get("_AI_DETECTOR_MOCK") == "1"
-    if ensemble_models and backend == "onnx" and not is_mock:
-        from onnx_detector import is_model_available
-        onnx_models_dir = getattr(args, "onnx_models_dir", DEFAULT_ONNX_MODELS_DIR)
-        unavailable = [m for m in ensemble_models if not is_model_available(m, onnx_models_dir)]
-        if unavailable:
-            names = ", ".join(unavailable)
-            sys.stderr.write(
-                f"WARNING: 다음 ensemble 모델이 onnx 번들에 없음; "
-                f"--backend torch 또는 setup.py로 변환 필요: {names}\n"
-            )
-            ensemble_models = [m for m in ensemble_models if m not in unavailable]
+    onnx_models_dir = getattr(args, "onnx_models_dir", DEFAULT_ONNX_MODELS_DIR)
 
-    # 중복 제거 후 합치기
-    model_set = list(ensemble_models)
-    for m in explicit_models:
-        if m not in model_set:
-            model_set.append(m)
+    model_set = resolve_ensemble_models_for_onnx(
+        ensemble_models=ensemble_models,
+        explicit_models=explicit_models,
+        backend=backend,
+        onnx_models_dir=onnx_models_dir,
+        is_mock=is_mock,
+        warn=lambda msg: sys.stderr.write(msg + "\n"),
+    )
 
     if not model_set:
         model_set = [DEFAULT_MODEL]

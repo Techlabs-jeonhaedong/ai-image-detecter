@@ -788,35 +788,25 @@ def detect(
     pipeline_fn = get_pipeline_fn_with_mock(backend, onnx_models_dir)
 
     # 모델 목록 결정
+    import sys as _sys
+    from backends import resolve_ensemble_models_for_onnx
     is_mock = os.environ.get("_AI_DETECTOR_MOCK") == "1"
-    ensemble_model_ids: List[str] = []
-    explicit_model_ids: List[str] = []
 
-    if ensemble:
-        ensemble_model_ids.extend(ENSEMBLE_MODELS)
+    ensemble_model_ids: List[str] = list(ENSEMBLE_MODELS) if ensemble else []
+    explicit_model_ids: List[str] = []
     if models:
         for m in models:
-            if m not in ensemble_model_ids and m not in explicit_model_ids:
+            if m not in explicit_model_ids:
                 explicit_model_ids.append(m)
 
-    # onnx 백엔드 + 비mock 환경: ensemble 유래 모델만 필터링 (명시 모델은 유지)
-    if ensemble_model_ids and backend == "onnx" and not is_mock:
-        from onnx_detector import is_model_available
-        unavailable = [m for m in ensemble_model_ids if not is_model_available(m, onnx_models_dir)]
-        if unavailable:
-            import sys
-            names = ", ".join(unavailable)
-            sys.stderr.write(
-                f"WARNING: 다음 ensemble 모델이 onnx 번들에 없음; "
-                f"--backend torch 또는 setup.py로 변환 필요: {names}\n"
-            )
-            ensemble_model_ids = [m for m in ensemble_model_ids if m not in unavailable]
-
-    # 중복 제거 후 합치기
-    model_ids = list(ensemble_model_ids)
-    for m in explicit_model_ids:
-        if m not in model_ids:
-            model_ids.append(m)
+    model_ids = resolve_ensemble_models_for_onnx(
+        ensemble_models=ensemble_model_ids,
+        explicit_models=explicit_model_ids,
+        backend=backend,
+        onnx_models_dir=onnx_models_dir,
+        is_mock=is_mock,
+        warn=lambda msg: _sys.stderr.write(msg + "\n"),
+    )
 
     if not model_ids:
         model_ids = [DEFAULT_MODEL]
