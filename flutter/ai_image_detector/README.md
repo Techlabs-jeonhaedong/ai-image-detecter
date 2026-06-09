@@ -7,6 +7,9 @@ Flutter 온디바이스 AI 이미지 탐지 패키지. ONNX Runtime으로 오프
 - Flutter 3.0+
 - Dart 3.10+
 - 플랫폼: iOS, Android, macOS, Windows, Linux
+- **iOS 16.0 이상** (`flutter_onnxruntime` 의존성 요구사항). 호스트 앱의
+  `ios/Flutter/AppFrameworkInfo.plist`(`MinimumOSVersion`)와
+  `ios/Runner.xcodeproj/project.pbxproj`(`IPHONEOS_DEPLOYMENT_TARGET`)를 `16.0`으로 설정해야 함.
 
 ## 설치
 
