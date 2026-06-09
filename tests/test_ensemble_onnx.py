@@ -106,6 +106,11 @@ class TestIsModelAvailable:
 class TestCliEnsembleOnnxExitZero:
     """--ensemble + onnx 백엔드 시 exit 0 및 stderr 경고 검증."""
 
+    @pytest.fixture(autouse=True)
+    def clear_mock_env(self, monkeypatch):
+        """test_server.py가 모듈 수준에서 설정한 _AI_DETECTOR_MOCK을 이 테스트에서 해제."""
+        monkeypatch.delenv("_AI_DETECTOR_MOCK", raising=False)
+
     def test_cli_ensemble_onnx_exit_zero(self, tmp_path, capsys):
         """
         onnx 기본 백엔드 + --ensemble: 번들 안 된 모델은 자동 제외하고 exit 0.
@@ -174,6 +179,11 @@ class TestCliEnsembleOnnxExitZero:
 class TestDetectApiEnsembleOnnx:
     """detector.detect(ensemble=True, backend='onnx') 단위 테스트."""
 
+    @pytest.fixture(autouse=True)
+    def clear_mock_env(self, monkeypatch):
+        """test_server.py가 모듈 수준에서 설정한 _AI_DETECTOR_MOCK을 이 테스트에서 해제."""
+        monkeypatch.delenv("_AI_DETECTOR_MOCK", raising=False)
+
     def test_detect_api_ensemble_onnx_uses_bundled(self):
         """
         detect(bytes, ensemble=True, backend='onnx') →
@@ -234,6 +244,11 @@ class TestDetectApiEnsembleOnnx:
 @pytest.mark.skipif(not _has_onnxruntime(), reason="onnxruntime 미설치")
 class TestExplicitUnbundledModelErrors:
     """명시적 --model 지정 시 미번들이면 기존처럼 에러 처리."""
+
+    @pytest.fixture(autouse=True)
+    def clear_mock_env(self, monkeypatch):
+        """test_server.py가 모듈 수준에서 설정한 _AI_DETECTOR_MOCK을 이 테스트에서 해제."""
+        monkeypatch.delenv("_AI_DETECTOR_MOCK", raising=False)
 
     def test_explicit_unbundled_model_onnx_errors(self, tmp_path, capsys):
         """
