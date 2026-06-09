@@ -469,8 +469,12 @@ class TestCLIBackendOption:
                 results = json_module.loads(output)
                 assert results[0]["verdict"] in ("AI-generated", "Real")
 
-    def test_backend_default_is_torch(self, tmp_path, valid_image_path):
-        """`--backend` 미지정 시 torch 경로 유지 (하위 호환)."""
+    def test_backend_default_is_onnx(self, tmp_path, valid_image_path):
+        """`--backend` 미지정 시 onnx가 기본 백엔드여야 한다."""
+        from detect import _build_parser
+        args = _build_parser().parse_args([valid_image_path])
+        assert args.backend == "onnx", f"expected 'onnx', got {args.backend!r}"
+
         with patch("detect._get_pipeline_fn") as mock_get:
             mock_pipeline = MagicMock()
             mock_pipeline.return_value = lambda img: [
@@ -573,15 +577,21 @@ class TestServerBackendEnvVar:
             # onnx 경로는 callable이어야 함
             assert callable(fn)
 
-    def test_server_default_backend_is_torch(self, monkeypatch):
-        """DETECTOR_BACKEND 미설정 시 torch 경로."""
+    def test_server_default_backend_is_onnx(self, monkeypatch):
+        """DETECTOR_BACKEND 미설정 시 onnx가 기본 백엔드여야 한다."""
         monkeypatch.delenv("DETECTOR_BACKEND", raising=False)
-        monkeypatch.setenv("_AI_DETECTOR_MOCK", "1")
-        monkeypatch.setenv("PYTEST_CURRENT_TEST", "1")
+        monkeypatch.delenv("_AI_DETECTOR_MOCK", raising=False)
 
-        import server
-        fn = server._make_pipeline()
-        assert callable(fn)
+        with patch("backends.get_backend_pipeline_fn") as mock_fn:
+            mock_fn.return_value = lambda *a, **kw: lambda img: [
+                {"label": "artificial", "score": 0.8},
+                {"label": "human", "score": 0.2},
+            ]
+            import server
+            server._make_pipeline()
+            mock_fn.assert_called_once()
+            called_backend = mock_fn.call_args[0][0]
+            assert called_backend == "onnx", f"expected 'onnx', got {called_backend!r}"
 
     def test_server_make_pipeline_onnx_callable(self, tmp_path, monkeypatch):
         """DETECTOR_BACKEND=onnx + mock session → pipeline_fn이 callable."""

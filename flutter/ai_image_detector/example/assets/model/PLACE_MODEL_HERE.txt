@@ -1,13 +1,18 @@
-# 모델 파일 위치 안내
+# 모델 번들 안내
 
-.onnx와 meta.json 파일을 이 디렉토리에 넣으세요.
+✅ 이미 경량 ONNX 모델이 이 디렉토리에 번들되어 있습니다.
+   - model.onnx  : Organika/sdxl-detector 의 MatMul-only INT8 양자화 모델 (약 91MB,
+                   모든 플랫폼 CPU/모바일 onnxruntime 호환)
+   - meta.json   : 전처리·라벨 설정
 
-변환 방법:
-  python convert_to_onnx.py --model Organika/sdxl-detector
+→ 별도 변환·복사 없이 클론 후 바로 `flutter run` 하면 동작합니다.
 
-생성된 파일:
-  onnx_models/Organika__sdxl-detector/model.onnx (또는 model_quantized.onnx)
-  onnx_models/Organika__sdxl-detector/meta.json
+## 모델을 다시 생성/교체하려면
 
-→ 이 두 파일을 flutter/ai_image_detector/example/assets/model/ 에 복사하세요.
-
+루트에서:
+  python setup.py            # onnx_models/Organika__sdxl-detector/model_quantized.onnx 생성
+그 후 이 디렉토리로 복사:
+  cp onnx_models/Organika__sdxl-detector/model_quantized.onnx \
+     flutter/ai_image_detector/example/assets/model/model.onnx
+  cp onnx_models/Organika__sdxl-detector/meta.json \
+     flutter/ai_image_detector/example/assets/model/meta.json

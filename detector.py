@@ -627,11 +627,13 @@ def analyze_images_batch(
     """
     # 모델별 pipeline 1회 생성 후 캐시
     cached_pipelines: Dict[str, Optional[Callable]] = {}
+    pipeline_errors: Dict[str, str] = {}  # 생성 실패 시 에러 메시지 보존
     for model_id in model_ids:
         try:
             cached_pipelines[model_id] = pipeline_fn("image-classification", model=model_id)
         except Exception as e:
             cached_pipelines[model_id] = None  # 실패 시 None으로 표시
+            pipeline_errors[model_id] = str(e)
 
     results = []
     for idx, image_path in enumerate(image_paths):
@@ -673,7 +675,8 @@ def analyze_images_batch(
 
             pipe = cached_pipelines.get(model_id)
             if pipe is None:
-                model_entry["error"] = f"Pipeline creation failed for {model_id}"
+                err_msg = pipeline_errors.get(model_id) or f"Pipeline creation failed for {model_id}"
+                model_entry["error"] = err_msg
                 per_model_results.append(model_entry)
                 continue
 
@@ -744,12 +747,12 @@ def detect(
     source: ImageSource,
     *,
     name: Optional[str] = None,
-    backend: str = "torch",
+    backend: str = "onnx",
     models: Optional[List[str]] = None,
     ensemble: bool = False,
     threshold: float = 0.5,
     with_metadata: bool = True,
-    onnx_models_dir: str = "onnx_models",
+    onnx_models_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     고수준 편의 API. 이미지 소스를 받아 AI 탐지 결과 dict를 반환한다.
@@ -757,12 +760,12 @@ def detect(
     Args:
         source: 이미지 소스 — 파일 경로(str), bytes, bytearray, file-like 모두 허용
         name: bytes/file-like 입력 시 결과 image 필드에 쓸 표시명 (경로 입력이면 무시)
-        backend: 추론 백엔드 ("torch" 또는 "onnx")
+        backend: 추론 백엔드 ("onnx"(기본) 또는 "torch")
         models: 사용할 모델 ID 목록 (None이면 기본 모델)
         ensemble: True면 ENSEMBLE_MODELS 전체 사용
         threshold: AI 판정 임계값 (기본 0.5)
         with_metadata: True면 메타데이터 검사 결과를 포함하고 verdict_source 설정
-        onnx_models_dir: ONNX 모델 디렉토리
+        onnx_models_dir: ONNX 모델 디렉토리 (None이면 번들 기본 경로 사용)
 
     Returns:
         단일 이미지 분석 결과 dict (verdict, ai_probability, metadata, verdict_source 포함)
@@ -771,8 +774,11 @@ def detect(
         >>> result = detect(open("photo.jpg", "rb").read(), name="photo.jpg", ensemble=True)
         >>> print(result["verdict"])  # "AI-generated" or "Real"
     """
-    from backends import get_pipeline_fn_with_mock
+    from backends import get_pipeline_fn_with_mock, DEFAULT_ONNX_MODELS_DIR
     from metadata import inspect_metadata
+
+    if onnx_models_dir is None:
+        onnx_models_dir = DEFAULT_ONNX_MODELS_DIR
 
     # ── 진입부 1회 정규화: file-like 스트림 소진 버그 방지 ─────────────────
     # str/bytes는 그대로, file-like는 여기서 1회 read() → bytes로 변환.
@@ -782,13 +788,36 @@ def detect(
     pipeline_fn = get_pipeline_fn_with_mock(backend, onnx_models_dir)
 
     # 모델 목록 결정
-    model_ids: List[str] = []
+    is_mock = os.environ.get("_AI_DETECTOR_MOCK") == "1"
+    ensemble_model_ids: List[str] = []
+    explicit_model_ids: List[str] = []
+
     if ensemble:
-        model_ids.extend(ENSEMBLE_MODELS)
+        ensemble_model_ids.extend(ENSEMBLE_MODELS)
     if models:
         for m in models:
-            if m not in model_ids:
-                model_ids.append(m)
+            if m not in ensemble_model_ids and m not in explicit_model_ids:
+                explicit_model_ids.append(m)
+
+    # onnx 백엔드 + 비mock 환경: ensemble 유래 모델만 필터링 (명시 모델은 유지)
+    if ensemble_model_ids and backend == "onnx" and not is_mock:
+        from onnx_detector import is_model_available
+        unavailable = [m for m in ensemble_model_ids if not is_model_available(m, onnx_models_dir)]
+        if unavailable:
+            import sys
+            names = ", ".join(unavailable)
+            sys.stderr.write(
+                f"WARNING: 다음 ensemble 모델이 onnx 번들에 없음; "
+                f"--backend torch 또는 setup.py로 변환 필요: {names}\n"
+            )
+            ensemble_model_ids = [m for m in ensemble_model_ids if m not in unavailable]
+
+    # 중복 제거 후 합치기
+    model_ids = list(ensemble_model_ids)
+    for m in explicit_model_ids:
+        if m not in model_ids:
+            model_ids.append(m)
+
     if not model_ids:
         model_ids = [DEFAULT_MODEL]
 

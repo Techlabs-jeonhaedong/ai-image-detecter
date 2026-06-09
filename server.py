@@ -50,12 +50,12 @@ _PIPELINE_CACHE_LOCK = threading.Lock()
 def _make_pipeline():
     """
     환경변수 _AI_DETECTOR_MOCK=1이면 mock pipeline 팩토리 반환.
-    그 외에는 DETECTOR_BACKEND 환경변수(기본 torch)에 따라 backend 선택.
+    그 외에는 DETECTOR_BACKEND 환경변수(기본 onnx)에 따라 backend 선택.
     백엔드 선택 로직은 backends.get_pipeline_fn_with_mock으로 위임.
     """
-    from backends import get_pipeline_fn_with_mock
-    backend = os.environ.get("DETECTOR_BACKEND", "torch")
-    onnx_models_dir = os.environ.get("ONNX_MODELS_DIR", "onnx_models")
+    from backends import get_pipeline_fn_with_mock, DEFAULT_ONNX_MODELS_DIR
+    backend = os.environ.get("DETECTOR_BACKEND", "onnx")
+    onnx_models_dir = os.environ.get("ONNX_MODELS_DIR", DEFAULT_ONNX_MODELS_DIR)
     return get_pipeline_fn_with_mock(backend, onnx_models_dir)
 
 

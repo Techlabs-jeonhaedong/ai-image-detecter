@@ -83,6 +83,39 @@ def _validate_model_path(model_id: str, onnx_models_dir: str) -> str:
     return model_path
 
 
+def is_model_available(model_id: str, onnx_models_dir: str) -> bool:
+    """
+    model_id에 해당하는 ONNX 모델이 onnx_models_dir에 번들돼 있는지 확인한다.
+
+    안전하지 않은 model_id(path traversal 시도 등)이거나 모델 디렉토리가 없거나
+    .onnx 파일이 없으면 False를 반환한다. 예외를 던지지 않는다.
+
+    Args:
+        model_id: HuggingFace 모델 ID (예: "Organika/sdxl-detector")
+        onnx_models_dir: ONNX 모델 베이스 디렉토리
+
+    Returns:
+        bool — True이면 번들 존재, False이면 미존재 또는 안전하지 않은 id
+    """
+    try:
+        model_dir = _validate_model_path(model_id, onnx_models_dir)
+    except (ValueError, Exception):
+        return False
+
+    if not os.path.isdir(model_dir):
+        return False
+
+    # .onnx 파일이 하나라도 있어야 한다
+    try:
+        for fname in os.listdir(model_dir):
+            if fname.endswith(".onnx"):
+                return True
+    except OSError:
+        return False
+
+    return False
+
+
 def _validate_meta(meta: Dict[str, Any]) -> None:
     """
     meta.json 스키마를 검증한다. 위반 시 ValueError 발생.
@@ -328,7 +361,8 @@ def get_onnx_pipeline_fn(onnx_models_dir: str = "onnx_models") -> Callable:
             raise FileNotFoundError(
                 f"ONNX 모델 미변환: '{model}'. "
                 f"먼저 convert_to_onnx.py 실행 필요 "
-                f"(python convert_to_onnx.py --model {model})"
+                f"(python convert_to_onnx.py --model {model}). "
+                f"또는 `--backend torch`로 실행하거나 `python setup.py {model}`로 변환하세요."
             )
 
         meta = _load_meta(model_dir)

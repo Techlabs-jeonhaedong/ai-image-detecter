@@ -87,6 +87,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         dest="skip_install",
         help="pip install -r requirements-convert.txt 단계를 건너뜀",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        dest="force",
+        help="번들 모델이 있어도 강제 재빌드 (기본: 번들 감지 시 빌드 건너뜀)",
+    )
     return parser
 
 
@@ -110,6 +116,26 @@ def _human_size(path: Path) -> str:
     if size >= 1_048_576:
         return f"{size / 1_048_576:.1f} MB"
     return f"{size / 1024:.0f} KB"
+
+
+# ── 단계 0: 런타임 의존성 설치 ───────────────────────────────────────────────
+
+def install_runtime_deps() -> None:
+    """requirements-onnx.txt를 pip install로 설치한다 (추론에 필요)."""
+    import subprocess
+    req_file = SCRIPT_DIR / "requirements-onnx.txt"
+    if not req_file.is_file():
+        print(f"[경고] requirements-onnx.txt 없음: {req_file} — 런타임 의존성 설치 건너뜀")
+        return
+    print("[0단계] 런타임 의존성 설치 중 (requirements-onnx.txt)...")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "-r", str(req_file)],
+        cwd=str(SCRIPT_DIR),
+    )
+    if result.returncode != 0:
+        print("[오류] 런타임 의존성 설치 실패", file=sys.stderr)
+        sys.exit(result.returncode)
+    print("[완료] 런타임 의존성 설치 완료")
 
 
 # ── 단계 1: 의존성 설치 ───────────────────────────────────────────────────────
@@ -313,7 +339,7 @@ def verify_onnx_cpu_loadable(path: str, image_size: int = 224) -> bool:
 
 # ── 모델 1개 처리 ─────────────────────────────────────────────────────────────
 
-def process_model(model_id: str, output_base: str) -> None:
+def process_model(model_id: str, output_base: str, force: bool = False) -> None:
     """
     단일 모델에 대해 4단계 빌드를 수행한다:
       2단계: ONNX export + meta.json
@@ -321,9 +347,13 @@ def process_model(model_id: str, output_base: str) -> None:
       4단계: MatMul-only 양자화
       5단계: self-test 검증
 
+    번들 모델(model_quantized.onnx)이 이미 존재하고 force=False이면
+    self-test 검증만 수행하고 빌드를 건너뛴다.
+
     Args:
         model_id: HuggingFace 모델 ID
         output_base: 기본 출력 디렉토리
+        force: True이면 번들 모델이 있어도 강제 재빌드
 
     Raises:
         SystemExit: 각 단계 실패 시 비0 exit
@@ -335,6 +365,29 @@ def process_model(model_id: str, output_base: str) -> None:
     print(f"모델: {model_id}")
     print(f"출력: {model_dir}")
     print(f"{'=' * 50}")
+
+    # 번들 감지: model_quantized.onnx가 이미 있고 force가 아니면 빌드 건너뜀
+    quantized_path = model_dir / "model_quantized.onnx"
+    if quantized_path.exists() and not force:
+        print(f"[번들 감지] 이미 번들된 경량 모델 존재: {quantized_path}")
+        print("  → 빌드 건너뜀. self-test 검증만 수행합니다.")
+        # meta.json에서 image_size 읽기
+        meta_path = model_dir / "meta.json"
+        image_size = 224
+        if meta_path.is_file():
+            import json
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+            image_size = meta.get("crop_size") or meta.get("image_size") or 224
+        try:
+            verify_onnx_cpu_loadable(str(quantized_path), image_size=image_size)
+        except VerificationError as e:
+            print(f"[경고] 번들 모델 self-test 실패: {e}", file=sys.stderr)
+            print("  → 자동 재빌드를 진행합니다.")
+            # 검증 실패 시 재빌드로 fall-through
+        else:
+            print(f"[완료] 번들 모델 검증 성공 — 빌드 건너뜀")
+            return
 
     # 2단계: ONNX export + meta.json (convert_to_onnx.py 재사용)
     onnx_path = export_onnx(model_id, output_base)
@@ -417,11 +470,19 @@ def main() -> None:
     print(f"출력 디렉토리: {output_base}")
     print(f"대상 모델: {models}")
 
-    # 1단계: 의존성 설치
+    # 번들 모델 사전 조사: 하나라도 없으면 변환 의존성 설치 필요
+    build_needed = args.force or any(
+        not (_model_dir(output_base, m) / "model_quantized.onnx").exists()
+        for m in models
+    )
+
+    # 의존성 설치
     if not args.skip_install:
-        install_deps()
+        install_runtime_deps()  # 추론에 필요 — 항상 설치
+        if build_needed:
+            install_deps()       # 변환에 필요 — 빌드가 필요할 때만
     else:
-        print("[1단계] 의존성 설치 건너뜀 (--skip-install)")
+        print("[0단계] 의존성 설치 건너뜀 (--skip-install)")
 
     # 출력 디렉토리 생성
     Path(output_base).mkdir(parents=True, exist_ok=True)
@@ -430,7 +491,7 @@ def main() -> None:
     failed = []
     for model_id in models:
         try:
-            process_model(model_id, output_base)
+            process_model(model_id, output_base, force=args.force)
         except SystemExit:
             failed.append(model_id)
         except Exception as e:
@@ -447,11 +508,25 @@ def main() -> None:
         sys.exit(1)
 
     print(f"[완료] 전체 완료. 처리 모델 수: {len(models)}")
-    print(f"런타임 의존성 설치: pip install -r requirements-onnx.txt")
-    print(
-        f"추론 사용법: "
-        f"python detect.py image.jpg --backend onnx --onnx-models-dir {output_base}"
-    )
+    bundled_all = not build_needed
+    if bundled_all:
+        print(
+            "\n[번들 모델 사용 안내]\n"
+            "  이 저장소에는 경량 ONNX 모델이 이미 포함되어 있습니다.\n"
+            "  별도 모델 준비 없이 바로 추론할 수 있습니다:\n"
+            "\n"
+            "    python detect.py photo.jpg\n"
+            "\n"
+            "  (기본 백엔드: onnx — onnxruntime만 필요, torch 불필요)\n"
+            "  torch 백엔드를 사용하려면: python detect.py photo.jpg --backend torch"
+        )
+    else:
+        print(f"런타임 의존성 설치: pip install -r requirements-onnx.txt")
+        print(
+            f"추론 사용법: python detect.py image.jpg\n"
+            f"  (기본 백엔드 onnx — onnxruntime만 필요)\n"
+            f"  옵션: --backend onnx --onnx-models-dir {output_base}"
+        )
 
 
 if __name__ == "__main__":

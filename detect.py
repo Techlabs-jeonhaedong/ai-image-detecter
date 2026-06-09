@@ -16,6 +16,9 @@ AI 이미지 탐지 CLI.
   둘을 합쳐서 중복 없이 모든 모델을 사용한다.
   예: --ensemble --model extra/model → ENSEMBLE_MODELS + extra/model (중복 제거)
 
+기본 백엔드: onnx (번들된 경량 ONNX 모델 사용, onnxruntime만 필요)
+  torch 백엔드 사용 시: --backend torch (transformers 설치 필요)
+
 예시:
   python detect.py photo.jpg
   python detect.py img1.jpg img2.png --json
@@ -23,6 +26,7 @@ AI 이미지 탐지 CLI.
   python detect.py photo.jpg --ensemble
   python detect.py photo.jpg --ensemble --threshold 0.7
   python detect.py photo.jpg --no-metadata
+  python detect.py photo.jpg --backend torch
 """
 
 import argparse
@@ -30,6 +34,7 @@ import json
 import os
 import sys
 
+from backends import DEFAULT_ONNX_MODELS_DIR
 from detector import DEFAULT_MODEL
 
 DEFAULT_THRESHOLD = 0.5
@@ -82,15 +87,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backend",
         choices=["torch", "onnx"],
-        default="torch",
-        help="추론 백엔드 선택: torch(기본, transformers 필요) 또는 onnx(경량, onnxruntime만 필요)",
+        default="onnx",
+        help="추론 백엔드 선택: onnx(기본, 번들 경량 모델·onnxruntime만 필요) 또는 torch(transformers 필요)",
     )
     parser.add_argument(
         "--onnx-models-dir",
-        default="onnx_models",
+        default=DEFAULT_ONNX_MODELS_DIR,
         metavar="DIR",
         dest="onnx_models_dir",
-        help="ONNX 모델 디렉토리 (--backend onnx 시 사용, 기본: onnx_models)",
+        help=f"ONNX 모델 디렉토리 (기본: {DEFAULT_ONNX_MODELS_DIR})",
     )
     return parser
 
@@ -102,7 +107,7 @@ def _validate_threshold(value: float) -> None:
         )
 
 
-def _get_pipeline_fn(backend: str = "torch", onnx_models_dir: str = "onnx_models"):
+def _get_pipeline_fn(backend: str = "onnx", onnx_models_dir: str = DEFAULT_ONNX_MODELS_DIR):
     """
     환경변수 _AI_DETECTOR_MOCK=1 이면 mock pipeline 반환 (테스트용).
     그 외에는 backend에 따라 실제 pipeline 반환.
@@ -118,18 +123,44 @@ def _resolve_models(args) -> list:
 
     --ensemble과 --model 동시 지정 시 둘을 합친다.
     둘 다 없으면 기본 모델 하나를 반환한다.
+
+    onnx 백엔드 + 비mock 환경일 때:
+      ensemble 유래 모델 중 번들 안 된 것은 자동 제외하고 stderr에 경고 출력.
+      --model로 명시된 모델은 제외하지 않는다 (사용자 의도 보존).
     """
     from detector import ENSEMBLE_MODELS
 
-    model_set = []
+    ensemble_models = []
+    explicit_models = []
 
     if args.ensemble:
-        model_set.extend(ENSEMBLE_MODELS)
+        ensemble_models.extend(ENSEMBLE_MODELS)
 
     if args.models:
         for m in args.models:
-            if m not in model_set:
-                model_set.append(m)
+            if m not in ensemble_models and m not in explicit_models:
+                explicit_models.append(m)
+
+    # onnx 백엔드 + 비mock 환경: ensemble 유래 모델만 필터링
+    backend = getattr(args, "backend", "onnx")
+    is_mock = os.environ.get("_AI_DETECTOR_MOCK") == "1"
+    if ensemble_models and backend == "onnx" and not is_mock:
+        from onnx_detector import is_model_available
+        onnx_models_dir = getattr(args, "onnx_models_dir", DEFAULT_ONNX_MODELS_DIR)
+        unavailable = [m for m in ensemble_models if not is_model_available(m, onnx_models_dir)]
+        if unavailable:
+            names = ", ".join(unavailable)
+            sys.stderr.write(
+                f"WARNING: 다음 ensemble 모델이 onnx 번들에 없음; "
+                f"--backend torch 또는 setup.py로 변환 필요: {names}\n"
+            )
+            ensemble_models = [m for m in ensemble_models if m not in unavailable]
+
+    # 중복 제거 후 합치기
+    model_set = list(ensemble_models)
+    for m in explicit_models:
+        if m not in model_set:
+            model_set.append(m)
 
     if not model_set:
         model_set = [DEFAULT_MODEL]

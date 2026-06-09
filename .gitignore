@@ -9,8 +9,10 @@ venv/
 # HuggingFace 모델 캐시 (로컬 다운로드)
 .cache/
 
-# ONNX 변환 산출물 (convert_to_onnx.py 결과, 용량 큼)
-onnx_models/
+# ONNX: 큰 비양자화 원본/외부데이터만 무시(재생성 가능), 경량 양자화 모델은 번들 커밋
+onnx_models/**/model.onnx
+onnx_models/**/*.onnx_data
+onnx_models/**/*.onnx.data
 
 # Flutter 빌드 산출물 / 패키지 캐시
 flutter/**/build/
@@ -18,9 +20,12 @@ flutter/**/.dart_tool/
 flutter/**/.flutter-plugins
 flutter/**/.flutter-plugins-dependencies
 flutter/**/pubspec.lock
-# 번들 모델 파일 (변환 후 수동 복사, 용량 큼)
+# 번들 모델 파일: 기본은 무시하되, example 앱은 클론 즉시 설치/실행을 위해
+# 경량 양자화 모델(model.onnx ← model_quantized.onnx 사본) + meta.json을 번들 커밋
 flutter/**/assets/model/*.onnx
 flutter/**/assets/model/*.json
+!flutter/ai_image_detector/example/assets/model/model.onnx
+!flutter/ai_image_detector/example/assets/model/meta.json
 
 # OS
 .DS_Store

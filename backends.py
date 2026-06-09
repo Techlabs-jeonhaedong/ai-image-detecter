@@ -8,10 +8,15 @@ import os
 import sys
 from typing import Callable
 
+# 기본 ONNX 모델 디렉토리 — 이 파일 기준 절대경로 (어느 cwd에서 실행해도 동일)
+DEFAULT_ONNX_MODELS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "onnx_models"
+)
+
 
 def get_backend_pipeline_fn(
-    backend: str = "torch",
-    onnx_models_dir: str = "onnx_models",
+    backend: str = "onnx",
+    onnx_models_dir: str = DEFAULT_ONNX_MODELS_DIR,
 ) -> Callable:
     """
     백엔드 종류에 따라 pipeline_fn을 반환하는 공통 헬퍼.
@@ -41,8 +46,8 @@ def get_backend_pipeline_fn(
 
 
 def get_pipeline_fn_with_mock(
-    backend: str = "torch",
-    onnx_models_dir: str = "onnx_models",
+    backend: str = "onnx",
+    onnx_models_dir: str = DEFAULT_ONNX_MODELS_DIR,
     pytest_context: bool = False,
 ) -> Callable:
     """

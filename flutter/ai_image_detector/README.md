@@ -18,7 +18,17 @@ dependencies:
     path: flutter/ai_image_detector  # 로컬 경로 또는 pub.dev 버전
 ```
 
-## 모델 준비
+## 빠른 체험 (example 앱)
+
+`example/` 앱에는 경량 ONNX 모델이 **이미 번들**되어 있어 클론 후 바로 실행됩니다:
+
+```bash
+cd flutter/ai_image_detector/example && flutter pub get && flutter run
+```
+
+아래 "모델 준비"는 **본인 앱에 패키지를 통합**할 때만 필요합니다.
+
+## 모델 준비 (본인 앱 통합 시)
 
 ### 1. ONNX 변환
 
@@ -129,8 +139,8 @@ Python `detector.py`와 동일:
 
 | 항목 | 비고 |
 |------|------|
-| 모델 크기 | ~75MB (model.onnx, 양자화 전) |
-| 양자화 모델 | ~20MB (model_quantized.onnx) |
+| 원본 ONNX | ~353MB (fp32 export, 번들 안 함) |
+| 양자화 모델(번들) | ~91MB (MatMul-only INT8, example 앱에 번들) |
 | 추론 시간 | 기기·모델에 따라 다름 (ARM64 ~100-500ms) |
 | 메모리 | InferenceSession 1회 생성 후 재사용 |
 
