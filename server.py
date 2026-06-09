@@ -20,7 +20,6 @@ AI 생성 여부를 JSON으로 반환한다.
 import logging
 import os
 import sys
-import tempfile
 import threading
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
@@ -91,17 +90,6 @@ def cached_pipeline_fn(task: str, model: str = "", **kwargs) -> Any:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 임시 파일 헬퍼 (테스트에서 monkeypatch 가능하도록 함수로 분리)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _create_temp_file(suffix: str) -> str:
-    """임시 파일 경로를 생성하고 반환한다 (파일은 비어있음)."""
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    os.close(fd)
-    return path
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # FastAPI 앱
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -162,7 +150,7 @@ def health():
 
 
 @app.post("/detect")
-def detect(
+def detect_endpoint(
     file: UploadFile = File(...),
     threshold: Optional[str] = Form(default=None),
     ensemble: bool = Form(default=False),
@@ -200,12 +188,15 @@ def detect(
         if not (0.0 <= parsed_threshold <= 1.0):
             raise HTTPException(status_code=400, detail=f"threshold must be in [0, 1], got {parsed_threshold}")
 
-    # ── 파일 크기 제한 검사 (동기 읽기) ───────────────────────────────────
-    content = file.file.read()
+    # ── 파일 크기 제한 검사 (상한 읽기로 메모리 DoS 방어) ─────────────────
+    # Content-Length 없는 chunked 요청이 미들웨어를 우회해도 여기서 방어.
+    # MAX_UPLOAD_BYTES + 1 바이트만 읽어 상한 초과 여부를 확인한다.
+    # 상한 이상은 메모리에 적재되지 않는다 (이중 방어: 미들웨어 + 여기).
+    content = file.file.read(MAX_UPLOAD_BYTES + 1)
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(
             status_code=413,
-            detail=f"Upload too large: {len(content)} bytes (limit: {MAX_UPLOAD_BYTES} bytes)",
+            detail=f"Upload too large (limit: {MAX_UPLOAD_BYTES} bytes)",
         )
 
     # ── 빈 파일 검사 ─────────────────────────────────────────────────────
@@ -236,55 +227,42 @@ def detect(
                 detail=f"Model(s) not in ALLOWED_MODELS: {blocked}",
             )
 
-    # ── 파일 확장자 추출 ─────────────────────────────────────────────────
-    filename = file.filename or "upload.bin"
-    _, ext = os.path.splitext(filename)
-    if not ext:
-        ext = ".bin"
+    # ── 원본 파일명 추출 및 정리 ─────────────────────────────────────────
+    # os.path.basename으로 경로 구분자 및 '..' 제거
+    raw_filename = file.filename or "upload.bin"
+    filename = os.path.basename(raw_filename) or "upload.bin"
 
-    # ── 임시 파일에 저장 후 분석 ─────────────────────────────────────────
-    tmp_path = None
-    try:
-        tmp_path = _create_temp_file(ext)
-        with open(tmp_path, "wb") as f:
-            f.write(content)
+    # ── bytes를 직접 분석 (임시파일 없이) ────────────────────────────────
+    results = analyze_images_batch(
+        image_paths=[content],
+        pipeline_fn=cached_pipeline_fn,
+        model_ids=model_ids,
+        threshold=parsed_threshold,
+        names=[filename],
+    )
+    result = results[0]
 
-        results = analyze_images_batch(
-            image_paths=[tmp_path],
-            pipeline_fn=cached_pipeline_fn,
-            model_ids=model_ids,
-            threshold=parsed_threshold,
-        )
-        result = results[0]
+    # 단일 모델이면 model 필드를 ID 자체로 표시 (detect.py와 동일 정책)
+    if len(model_ids) == 1:
+        result["model"] = model_ids[0]
 
-        # 단일 모델이면 model 필드를 ID 자체로 표시 (detect.py와 동일 정책)
-        if len(model_ids) == 1:
-            result["model"] = model_ids[0]
+    # ── 메타데이터 검사 ───────────────────────────────────────────────────
+    if not no_metadata:
+        meta = inspect_metadata(content)
+        result["metadata"] = meta
+        result = _apply_metadata_override(result, meta)
+    else:
+        result["metadata"] = {
+            "has_ai_signal": False,
+            "decisive": False,
+            "signals": [],
+            "source": None,
+            "checked": False,
+        }
+        result["verdict_source"] = "model"
 
-        # ── 메타데이터 검사 ───────────────────────────────────────────────
-        if not no_metadata:
-            meta = inspect_metadata(tmp_path)
-            result["metadata"] = meta
-            result = _apply_metadata_override(result, meta)
-        else:
-            result["metadata"] = {
-                "has_ai_signal": False,
-                "decisive": False,
-                "signals": [],
-                "source": None,
-                "checked": False,
-            }
-            result["verdict_source"] = "model"
-
-        # image 필드를 원본 파일명으로 교체 (임시 경로 노출 방지)
-        result["image"] = filename
-
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    # image 필드는 analyze_images_batch에서 names로 지정되므로 그대로 사용
+    # (이미 filename으로 설정됨)
 
     return result
 

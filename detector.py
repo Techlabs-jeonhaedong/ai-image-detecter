@@ -15,13 +15,28 @@ AI 이미지 탐지 핵심 로직 모듈.
   Real 계열: real, human, natural, photo, authentic
 """
 
+import io
 import os
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, BinaryIO, Callable, Dict, List, Optional, Union
+
+# 이미지 입력 소스 타입 별칭
+# str: 파일 경로, bytes/bytearray: 파일 내용, BinaryIO: read()를 가진 바이너리 스트림
+ImageSource = Union[str, bytes, bytearray, BinaryIO]
 
 try:
     from transformers import pipeline as transformers_pipeline
 except ImportError:  # transformers가 설치되지 않은 환경(CI 등) 대비
     transformers_pipeline = None  # type: ignore
+
+# ── 이미지 해상도 상한 ──────────────────────────────────────────────────────
+# PIL DecompressionBomb 방어: 1억 픽셀(약 10000x10000)로 명시 설정.
+# 기본값(178M)보다 낮춰 메모리 DoS 위험 감소.
+MAX_IMAGE_PIXELS: int = 100_000_000
+try:
+    from PIL import Image as _PILImage
+    _PILImage.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+except Exception:
+    pass
 
 # 기본 모델
 DEFAULT_MODEL = "Organika/sdxl-detector"
@@ -235,59 +250,122 @@ def format_result(result: Dict[str, Any], json_mode: bool) -> str:
     return "\n".join(lines)
 
 
-def _load_image(image_path: str):
+def _normalize_source(source: ImageSource) -> Union[str, bytes]:
+    """
+    ImageSource를 str(경로) 또는 bytes 중 하나로 정규화한다.
+
+    진입점(detect, analyze_images_batch 등)에서 1회 호출해
+    file-like 스트림 소진 버그를 방지한다.
+
+    - str → 그대로 반환
+    - bytes/bytearray → bytes 반환 (1회 복사)
+    - file-like (.read() 보유) → 1회 read()로 bytes 변환
+    - 그 외 타입 → TypeError
+
+    seek 불가 스트림(소켓 등)도 1회 read이므로 안전하다.
+    """
+    if isinstance(source, str):
+        return source
+    if isinstance(source, (bytes, bytearray)):
+        return bytes(source)
+    if hasattr(source, "read") and callable(source.read):
+        return source.read()
+    raise TypeError(f"Unsupported image source type: {type(source).__name__!r}")
+
+
+def _load_image(source: ImageSource):
     """
     이미지를 열고 PIL Image를 반환한다.
+    source가 str이면 파일 경로로, bytes/bytearray/file-like이면 메모리에서 직접 로드.
     가능한 모든 예외를 체크해서 명확한 에러 메시지와 함께 raise.
     """
     from PIL import Image, UnidentifiedImageError
 
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"File not found: {image_path}")
+    # ── 소스 타입 판별 ─────────────────────────────────────────────────────
+    is_path = isinstance(source, str)
 
-    if not os.access(image_path, os.R_OK):
-        raise PermissionError(f"Permission denied: {image_path}")
+    if is_path:
+        # 경로일 때만 존재/접근 체크
+        if not os.path.exists(source):
+            raise FileNotFoundError(f"File not found: {source}")
+        if not os.access(source, os.R_OK):
+            raise PermissionError(f"Permission denied: {source}")
+        display_name = source
+    elif isinstance(source, (bytes, bytearray)):
+        # bytes / bytearray → BytesIO로 감싸기
+        display_name = "<in-memory image>"
+        raw_bytes: bytes = bytes(source)
+    elif hasattr(source, "read") and callable(source.read):
+        # file-like: read한 뒤 bytes로 보관 (진입부에서 _normalize_source 미호출 시 폴백)
+        display_name = "<in-memory image>"
+        raw_bytes = source.read()
+    else:
+        raise TypeError(f"Unsupported image source type: {type(source).__name__!r}")
 
+    # ── verify() 단계 ──────────────────────────────────────────────────────
     try:
-        img = Image.open(image_path)
-        img.verify()  # 손상 여부 체크
+        if is_path:
+            img = Image.open(source)
+        else:
+            img = Image.open(io.BytesIO(raw_bytes))
+        img.verify()  # 손상 여부 체크 (verify 후 이미지가 닫힘)
     except UnidentifiedImageError:
-        raise ValueError(f"Not a valid image file: {image_path}")
+        raise ValueError(f"Not a valid image file: {display_name}")
     except Image.DecompressionBombError:
-        raise ValueError(f"Image too large (potential decompression bomb): {image_path}")
+        raise ValueError(f"Image too large (potential decompression bomb): {display_name}")
     except Image.DecompressionBombWarning:
-        raise ValueError(f"Image too large (potential decompression bomb): {image_path}")
+        raise ValueError(f"Image too large (potential decompression bomb): {display_name}")
+    except (FileNotFoundError, PermissionError):
+        raise
     except Exception as e:
-        raise ValueError(f"Cannot open image '{image_path}': {e}")
+        raise ValueError(f"Cannot open image '{display_name}': {e}")
 
-    # verify() 후 이미지가 닫히므로 다시 열어야 함
+    # ── verify() 후 재오픈 및 완전 디코딩 ─────────────────────────────────
     try:
-        img = Image.open(image_path)
+        if is_path:
+            img = Image.open(source)
+        else:
+            img = Image.open(io.BytesIO(raw_bytes))  # raw_bytes로 재생성
         img.load()  # 완전히 디코딩
     except Image.DecompressionBombError:
-        raise ValueError(f"Image too large (potential decompression bomb): {image_path}")
+        raise ValueError(f"Image too large (potential decompression bomb): {display_name}")
     except Image.DecompressionBombWarning:
-        raise ValueError(f"Image too large (potential decompression bomb): {image_path}")
+        raise ValueError(f"Image too large (potential decompression bomb): {display_name}")
     except Exception as e:
-        raise ValueError(f"Cannot load image data '{image_path}': {e}")
+        raise ValueError(f"Cannot load image data '{display_name}': {e}")
 
     return img
 
 
+def _get_display_name(source: ImageSource, name: Optional[str] = None) -> str:
+    """
+    이미지 소스에서 표시명을 결정한다.
+    - 경로(str)면 경로 그대로
+    - bytes/file-like + name 지정 → name
+    - bytes/file-like + name 미지정 → "<in-memory>"
+    """
+    if isinstance(source, str):
+        return source
+    return name if name is not None else "<in-memory>"
+
+
 def analyze_image(
-    image_path: str,
+    image_path: ImageSource,
     pipeline_fn: Callable,
     model_id: str,
     threshold: float,
+    *,
+    name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     단일 이미지를 분석하고 결과 dict를 반환한다.
 
     Args:
-        image_path: 분석할 이미지 파일 경로
+        image_path: 분석할 이미지 — 파일 경로(str), bytes, bytearray, file-like 모두 허용
         pipeline_fn: transformers.pipeline 또는 호환 callable (DI / mock용)
         model_id: 사용할 HuggingFace 모델 ID
         threshold: AI 판정 임계값
+        name: bytes/file-like 입력 시 결과 image 필드에 쓸 표시명 (경로 입력이면 무시)
 
     Returns:
         {
@@ -300,8 +378,9 @@ def analyze_image(
             "metadata": {"has_ai_signal": bool, "signals": [...], "source": ..., "checked": bool},
         }
     """
+    display_name = _get_display_name(image_path, name)
     base_result = {
-        "image": image_path,
+        "image": display_name,
         "ai_probability": None,
         "verdict": None,
         "model": model_id,
@@ -320,7 +399,7 @@ def analyze_image(
             "models": [{"model": model_id, "ai_probability": None, "error": err}],
         }
 
-    result = _run_inference(image_path, pipe, model_id, threshold)
+    result = _run_inference(image_path, pipe, model_id, threshold, display_name=display_name)
     # models 상세 추가
     result["models"] = [
         {"model": model_id, "ai_probability": result["ai_probability"], "error": result["error"]}
@@ -332,21 +411,27 @@ def analyze_image(
 
 
 def _run_inference(
-    image_path: str,
+    source: ImageSource,
     pipe: Callable,
     model_id: str,
     threshold: float,
     pil_image=None,
+    display_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     단일 이미지에 대해 이미 생성된 pipe로 추론을 실행한다.
     analyze_image / analyze_images / analyze_image_ensemble 에서 공통으로 사용.
 
     Args:
+        source: 이미지 소스 (경로/bytes/file-like)
         pil_image: 이미 로드된 PIL Image (있으면 재사용, 없으면 새로 로드)
+        display_name: 결과 image 필드에 쓸 표시명 (None이면 source에서 자동 결정)
     """
+    if display_name is None:
+        display_name = _get_display_name(source)
+
     base_result = {
-        "image": image_path,
+        "image": display_name,
         "ai_probability": None,
         "verdict": None,
         "model": model_id,
@@ -356,7 +441,7 @@ def _run_inference(
         if pil_image is not None:
             img = pil_image.convert("RGB")
         else:
-            img = _load_image(image_path)
+            img = _load_image(source)
             img = img.convert("RGB")
         raw_results = pipe(img)
         ai_prob = extract_ai_probability(raw_results)
@@ -369,18 +454,21 @@ def _run_inference(
 
 
 def analyze_image_ensemble(
-    image_path: str,
+    image_path: ImageSource,
     model_pipelines: Dict[str, Callable],
     threshold: float,
+    *,
+    name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     여러 모델(pipeline)로 단일 이미지를 앙상블 추론한다.
     이미지는 1회만 로드해 재사용한다.
 
     Args:
-        image_path: 분석할 이미지 경로
+        image_path: 분석할 이미지 (경로/bytes/file-like)
         model_pipelines: {model_id: pipeline_callable} 딕셔너리
         threshold: AI 판정 임계값
+        name: bytes/file-like 입력 시 결과 image 필드에 쓸 표시명
 
     Returns:
         확장 스키마 결과 dict:
@@ -396,9 +484,10 @@ def analyze_image_ensemble(
     """
     n = len(model_pipelines)
     model_label = f"ensemble({n} models)"
+    display_name = _get_display_name(image_path, name)
 
     base_result: Dict[str, Any] = {
-        "image": image_path,
+        "image": display_name,
         "ai_probability": None,
         "verdict": None,
         "model": model_label,
@@ -432,7 +521,10 @@ def analyze_image_ensemble(
             per_model_results.append(model_entry)
             continue
 
-        infer_result = _run_inference(image_path, pipe, model_id, threshold, pil_image=pil_image)
+        infer_result = _run_inference(
+            image_path, pipe, model_id, threshold,
+            pil_image=pil_image, display_name=display_name,
+        )
         model_entry["ai_probability"] = infer_result["ai_probability"]
         model_entry["error"] = infer_result["error"]
         per_model_results.append(model_entry)
@@ -462,14 +554,20 @@ def analyze_image_ensemble(
 
 
 def analyze_images(
-    image_paths: List[str],
+    image_paths: List[ImageSource],
     pipeline_fn: Callable,
     model_id: str,
     threshold: float,
+    *,
+    names: Optional[List[Optional[str]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     여러 이미지를 순서대로 분석한다. 개별 실패는 에러 결과로 기록되고 나머지는 계속 처리.
     pipeline 생성 실패 시에도 프로세스가 종료되지 않고 모든 이미지에 에러 결과를 반환한다.
+
+    Args:
+        image_paths: 이미지 소스 목록 (경로/bytes/file-like 혼합 가능)
+        names: 각 소스에 대한 표시명 목록 (bytes/file-like 소스에만 의미 있음)
     """
     error_template = {
         "ai_probability": None,
@@ -484,17 +582,18 @@ def analyze_images(
         return [
             {
                 **error_template,
-                "image": p,
+                "image": _get_display_name(p, names[i] if names else None),
                 "error": err,
                 "models": [{"model": model_id, "ai_probability": None, "error": err}],
                 "metadata": {"has_ai_signal": False, "signals": [], "source": None, "checked": False},
             }
-            for p in image_paths
+            for i, p in enumerate(image_paths)
         ]
 
     results = []
-    for p in image_paths:
-        r = _run_inference(p, pipe, model_id, threshold)
+    for i, p in enumerate(image_paths):
+        display = _get_display_name(p, names[i] if names else None)
+        r = _run_inference(p, pipe, model_id, threshold, display_name=display)
         r["models"] = [
             {"model": model_id, "ai_probability": r["ai_probability"], "error": r["error"]}
         ]
@@ -505,20 +604,23 @@ def analyze_images(
 
 
 def analyze_images_batch(
-    image_paths: List[str],
+    image_paths: List[ImageSource],
     pipeline_fn: Callable,
     model_ids: List[str],
     threshold: float,
+    *,
+    names: Optional[List[Optional[str]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     여러 이미지를 여러 모델로 앙상블 분석한다.
     모델별 pipeline을 1회만 생성해 모든 이미지에 재사용한다.
 
     Args:
-        image_paths: 분석할 이미지 경로 목록
+        image_paths: 분석할 이미지 소스 목록 (경로/bytes/file-like 혼합 가능)
         pipeline_fn: pipeline 팩토리 함수
         model_ids: 모델 ID 목록
         threshold: AI 판정 임계값
+        names: 각 소스에 대한 표시명 목록 (bytes/file-like 소스에만 의미 있음)
 
     Returns:
         이미지별 analyze_image_ensemble 결과 리스트
@@ -532,7 +634,27 @@ def analyze_images_batch(
             cached_pipelines[model_id] = None  # 실패 시 None으로 표시
 
     results = []
-    for image_path in image_paths:
+    for idx, image_path in enumerate(image_paths):
+        # 진입부 1회 정규화: file-like 스트림 소진 버그 방지
+        try:
+            image_path = _normalize_source(image_path)
+        except TypeError as e:
+            display_name = _get_display_name(image_path, names[idx] if names else None)
+            n = len(model_ids)
+            model_label = f"ensemble({n} models)" if n > 1 else model_ids[0]
+            results.append({
+                "image": display_name,
+                "ai_probability": None,
+                "verdict": None,
+                "model": model_label,
+                "error": str(e),
+                "models": [{"model": m, "ai_probability": None, "error": str(e)} for m in model_ids],
+                "metadata": {"has_ai_signal": False, "decisive": False, "signals": [], "source": None, "checked": False},
+            })
+            continue
+
+        display_name = _get_display_name(image_path, names[idx] if names else None)
+
         # 이미지 1회 로드
         pil_image = None
         load_error: Optional[str] = None
@@ -555,7 +677,10 @@ def analyze_images_batch(
                 per_model_results.append(model_entry)
                 continue
 
-            infer_result = _run_inference(image_path, pipe, model_id, threshold, pil_image=pil_image)
+            infer_result = _run_inference(
+                image_path, pipe, model_id, threshold,
+                pil_image=pil_image, display_name=display_name,
+            )
             model_entry["ai_probability"] = infer_result["ai_probability"]
             model_entry["error"] = infer_result["error"]
             per_model_results.append(model_entry)
@@ -573,7 +698,7 @@ def analyze_images_batch(
             errors = [m["error"] for m in per_model_results if m["error"]]
             error_msg = errors[0] if errors else "All models failed"
             results.append({
-                "image": image_path,
+                "image": display_name,
                 "ai_probability": None,
                 "verdict": None,
                 "model": model_label,
@@ -585,7 +710,7 @@ def analyze_images_batch(
             avg_prob = sum(success_probs) / len(success_probs)
             verdict = determine_verdict(avg_prob, threshold)
             results.append({
-                "image": image_path,
+                "image": display_name,
                 "ai_probability": avg_prob,
                 "verdict": verdict,
                 "model": model_label,
@@ -613,3 +738,87 @@ def get_real_pipeline():
     테스트에서는 이 함수 대신 mock_pipeline을 주입해서 사용.
     """
     return _make_pipeline_with_trust_guard
+
+
+def detect(
+    source: ImageSource,
+    *,
+    name: Optional[str] = None,
+    backend: str = "torch",
+    models: Optional[List[str]] = None,
+    ensemble: bool = False,
+    threshold: float = 0.5,
+    with_metadata: bool = True,
+    onnx_models_dir: str = "onnx_models",
+) -> Dict[str, Any]:
+    """
+    고수준 편의 API. 이미지 소스를 받아 AI 탐지 결과 dict를 반환한다.
+
+    Args:
+        source: 이미지 소스 — 파일 경로(str), bytes, bytearray, file-like 모두 허용
+        name: bytes/file-like 입력 시 결과 image 필드에 쓸 표시명 (경로 입력이면 무시)
+        backend: 추론 백엔드 ("torch" 또는 "onnx")
+        models: 사용할 모델 ID 목록 (None이면 기본 모델)
+        ensemble: True면 ENSEMBLE_MODELS 전체 사용
+        threshold: AI 판정 임계값 (기본 0.5)
+        with_metadata: True면 메타데이터 검사 결과를 포함하고 verdict_source 설정
+        onnx_models_dir: ONNX 모델 디렉토리
+
+    Returns:
+        단일 이미지 분석 결과 dict (verdict, ai_probability, metadata, verdict_source 포함)
+
+    Example:
+        >>> result = detect(open("photo.jpg", "rb").read(), name="photo.jpg", ensemble=True)
+        >>> print(result["verdict"])  # "AI-generated" or "Real"
+    """
+    from backends import get_pipeline_fn_with_mock
+    from metadata import inspect_metadata
+
+    # ── 진입부 1회 정규화: file-like 스트림 소진 버그 방지 ─────────────────
+    # str/bytes는 그대로, file-like는 여기서 1회 read() → bytes로 변환.
+    # 이후 _load_image와 inspect_metadata 양쪽이 같은 bytes 객체를 사용한다.
+    source = _normalize_source(source)
+
+    pipeline_fn = get_pipeline_fn_with_mock(backend, onnx_models_dir)
+
+    # 모델 목록 결정
+    model_ids: List[str] = []
+    if ensemble:
+        model_ids.extend(ENSEMBLE_MODELS)
+    if models:
+        for m in models:
+            if m not in model_ids:
+                model_ids.append(m)
+    if not model_ids:
+        model_ids = [DEFAULT_MODEL]
+
+    # 배치 함수로 처리 (단일 이미지도 리스트로 감싸서)
+    raw_results = analyze_images_batch(
+        image_paths=[source],
+        pipeline_fn=pipeline_fn,
+        model_ids=model_ids,
+        threshold=threshold,
+        names=[name],
+    )
+    result = raw_results[0]
+
+    # 단일 모델이면 model 필드를 ID 자체로 표시
+    if len(model_ids) == 1:
+        result["model"] = model_ids[0]
+
+    # 메타데이터 검사
+    if with_metadata:
+        meta = inspect_metadata(source)
+        result["metadata"] = meta
+        result = _apply_metadata_override(result, meta)
+    else:
+        result["metadata"] = {
+            "has_ai_signal": False,
+            "decisive": False,
+            "signals": [],
+            "source": None,
+            "checked": False,
+        }
+        result["verdict_source"] = "model"
+
+    return result

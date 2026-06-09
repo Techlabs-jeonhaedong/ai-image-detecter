@@ -428,45 +428,23 @@ class TestUploadSizeLimit:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestTempFileCleanup:
-    def test_temp_file_deleted_after_request(self, client, tmp_path, monkeypatch):
-        """요청 처리 후 임시 파일이 삭제되어야 함."""
-        import server as srv
-        created_paths = []
+    def test_no_temp_file_created_during_request(self, client, monkeypatch):
+        """임시파일 없이 bytes가 직접 처리된다 — mkstemp가 호출되지 않아야 함."""
+        with patch("tempfile.mkstemp") as mock_mkstemp:
+            resp = client.post(
+                "/detect",
+                files={"file": ("test.png", _make_png_bytes(), "image/png")},
+            )
+        assert resp.status_code == 200
+        assert mock_mkstemp.call_count == 0, "tempfile.mkstemp가 호출됨 — 임시파일 없는 처리로 전환됐어야 함"
 
-        original_create = srv._create_temp_file
-
-        def tracking_create(suffix):
-            path = original_create(suffix)
-            created_paths.append(path)
-            return path
-
-        monkeypatch.setattr(srv, "_create_temp_file", tracking_create)
-
-        client.post(
-            "/detect",
-            files={"file": ("test.png", _make_png_bytes(), "image/png")},
-        )
-
-        for path in created_paths:
-            assert not os.path.exists(path), f"임시 파일이 삭제되지 않음: {path}"
-
-    def test_temp_file_deleted_even_when_analysis_raises(self, monkeypatch):
-        """분석 도중 예외가 발생해도 임시 파일이 정리되어야 함."""
+    def test_no_temp_file_when_analysis_raises(self, monkeypatch):
+        """분석 중 예외가 발생해도 임시 파일이 생성되지 않아야 함."""
         import server as srv
         from fastapi.testclient import TestClient
 
         monkeypatch.setenv("_AI_DETECTOR_MOCK", "1")
         srv._PIPELINE_CACHE.clear()
-
-        created_paths = []
-        original_create = srv._create_temp_file
-
-        def tracking_create(suffix):
-            path = original_create(suffix)
-            created_paths.append(path)
-            return path
-
-        monkeypatch.setattr(srv, "_create_temp_file", tracking_create)
 
         # analyze_images_batch가 예외를 던지도록 강제
         def exploding_batch(*args, **kwargs):
@@ -474,13 +452,12 @@ class TestTempFileCleanup:
 
         monkeypatch.setattr("server.analyze_images_batch", exploding_batch, raising=False)
 
-        with TestClient(srv.app) as c:
-            # 예외가 500으로 처리됨
-            c.post("/detect", files={"file": ("test.png", _make_png_bytes(), "image/png")})
+        with patch("tempfile.mkstemp") as mock_mkstemp:
+            with TestClient(srv.app) as c:
+                c.post("/detect", files={"file": ("test.png", _make_png_bytes(), "image/png")})
 
-        # 임시 파일은 반드시 삭제돼야 함
-        for path in created_paths:
-            assert not os.path.exists(path), f"예외 후 임시 파일 누수: {path}"
+        # 임시 파일이 생성되지 않아야 함
+        assert mock_mkstemp.call_count == 0, "예외 시에도 tempfile.mkstemp가 호출됨"
 
 
 # ──────────────────────────────────────────────────────────────────────────────

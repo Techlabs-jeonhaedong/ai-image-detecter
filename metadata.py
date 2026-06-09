@@ -10,13 +10,25 @@ Python 3.10+ 환경에서 `pip install c2pa-python` 시 C2PA 정식 매니페스
 자동으로 활성화된다. 미설치 상태가 정상이며 에러를 내지 않는다.
 """
 
+import io
 import json as _json
 import re
 import os
-from typing import Dict, List, Any, Optional, Tuple
+from typing import BinaryIO, Dict, List, Any, Optional, Tuple, Union
+
+# 이미지 입력 소스 타입 별칭 (detector.py와 동일)
+ImageSource = Union[str, bytes, bytearray, BinaryIO]
 
 # 파일 크기 상한: 이 이상이면 raw 바이트 스캔 건너뜀
 MAX_METADATA_SCAN_BYTES = 50 * 1024 * 1024  # 50MB
+
+# raw 바이트 스캔 범위 제한 (메모리 최적화):
+# AI 메타데이터 마커(C2PA, XMP, 도구명 등)는 대부분 파일 앞부분이나 뒷부분에 위치.
+# 전체를 lower()로 복사하면 메모리가 2배가 되므로, 앞/뒤 2MB만 스캔한다.
+# 주의: 파일 중간에만 마커가 있는 경우는 탐지되지 않는다.
+#        PNG text chunk / EXIF는 Pillow가 별도로 파싱하므로 영향 없음.
+SCAN_HEAD_BYTES: int = 2 * 1024 * 1024   # 앞부분 2MB
+SCAN_TAIL_BYTES: int = 2 * 1024 * 1024   # 뒷부분 2MB
 
 # ── PNG text chunk 키 전략 ────────────────────────────────────────────────
 # 키 존재만으로 신호 삼지 않고, 값 내부 패턴 검사만 수행.
@@ -304,12 +316,27 @@ def _try_c2pa_optional(image_path: str, signals: List[str]) -> Tuple[Optional[st
     return None, False
 
 
-def inspect_metadata(image_path: str) -> Dict[str, Any]:
+def _resolve_image_source(source: ImageSource) -> Tuple[Optional[str], Optional[bytes]]:
+    """
+    ImageSource를 (path_or_none, bytes_or_none) 형태로 분리한다.
+    - str → (path, None)
+    - bytes/bytearray/file-like → (None, bytes)
+    """
+    if isinstance(source, str):
+        return source, None
+    if isinstance(source, (bytes, bytearray)):
+        return None, bytes(source)
+    # file-like
+    data = source.read()
+    return None, bytes(data)
+
+
+def inspect_metadata(source: ImageSource) -> Dict[str, Any]:
     """
     이미지 메타데이터/출처를 검사해 AI 생성 신호를 탐지한다.
 
     Args:
-        image_path: 검사할 이미지 파일 경로
+        source: 검사할 이미지 — 파일 경로(str), bytes, bytearray, file-like 모두 허용
 
     Returns:
         {
@@ -324,6 +351,7 @@ def inspect_metadata(image_path: str) -> Dict[str, Any]:
         - has_ai_signal은 결정적 신호가 있을 때만 True. 약한 흔적만 있으면 False.
         - 신호가 없어도 Real을 보장하지 않음 (SNS 등에서 메타데이터 제거됨).
         - 예외를 던지지 않고 checked=False로 graceful 반환.
+        - c2pa-python 정식 검증은 경로 입력일 때만 수행 (from_file API 필요).
     """
     empty_result: Dict[str, Any] = {
         "has_ai_signal": False,
@@ -333,40 +361,67 @@ def inspect_metadata(image_path: str) -> Dict[str, Any]:
         "checked": False,
     }
 
-    if not image_path or not os.path.isfile(image_path):
+    # 소스 타입 분리
+    try:
+        image_path, in_memory_bytes = _resolve_image_source(source)
+    except Exception:
         return empty_result
+
+    # 경로 입력이면 기존 파일 존재 체크 유지
+    if image_path is not None:
+        if not image_path or not os.path.isfile(image_path):
+            return empty_result
 
     try:
         from PIL import Image, UnidentifiedImageError
 
-        # 파일 크기 확인 → 50MB 초과 시 raw 바이트 스캔 생략
-        try:
-            file_size = os.path.getsize(image_path)
-        except Exception:
-            file_size = 0
+        # 크기 확인 → 50MB 초과 시 raw 바이트 스캔 생략
+        if image_path is not None:
+            # 경로: os.path.getsize 사용
+            try:
+                file_size = os.path.getsize(image_path)
+            except Exception:
+                file_size = 0
+        else:
+            # 메모리: len(bytes) 사용
+            file_size = len(in_memory_bytes) if in_memory_bytes is not None else 0
 
         skip_raw_scan = file_size > MAX_METADATA_SCAN_BYTES
 
-        # raw bytes 읽기 (크기 제한 미초과 시에만)
+        # raw bytes 확보 (크기 제한 미초과 시에만)
+        # 메모리 최적화: 전체 lower() 복사 대신 앞/뒤 SCAN_HEAD_BYTES + SCAN_TAIL_BYTES만 스캔.
+        # AI 메타데이터 마커는 대부분 파일 앞부분(헤더)이나 뒷부분(XMP/C2PA)에 위치하므로 유효.
         raw_bytes: Optional[bytes] = None
         raw_lower: Optional[bytes] = None
         if not skip_raw_scan:
-            try:
-                with open(image_path, "rb") as f:
-                    raw_bytes = f.read()
-                raw_lower = raw_bytes.lower()
-            except Exception:
-                pass
+            if image_path is not None:
+                try:
+                    with open(image_path, "rb") as f:
+                        raw_bytes = f.read()
+                except Exception:
+                    pass
+            else:
+                raw_bytes = in_memory_bytes
+
+            if raw_bytes is not None:
+                # 앞 + 뒤 범위만 잘라서 lower() — 전체 복사 회피
+                head = raw_bytes[:SCAN_HEAD_BYTES]
+                tail = raw_bytes[-SCAN_TAIL_BYTES:] if len(raw_bytes) > SCAN_HEAD_BYTES else b""
+                scan_region = head + tail
+                raw_lower = scan_region.lower()
 
         signals: List[str] = []
         any_decisive = False
-        source: Optional[str] = None
+        c2pa_result_source: Optional[str] = None
 
         # Pillow로 이미지 파싱 시도
         pillow_ok = False
         pillow_img = None
         try:
-            pillow_img = Image.open(image_path)
+            if image_path is not None:
+                pillow_img = Image.open(image_path)
+            else:
+                pillow_img = Image.open(io.BytesIO(in_memory_bytes))
             pillow_img.load()
             pillow_ok = True
         except Exception:
@@ -392,9 +447,10 @@ def inspect_metadata(image_path: str) -> Dict[str, Any]:
             pass
 
         # raw bytes 기반 탐지 (크기 제한 미초과 시에만)
+        # raw_lower는 앞/뒤 SCAN_HEAD_BYTES+SCAN_TAIL_BYTES 스캔 영역의 lower() 결과
         if raw_bytes is not None and raw_lower is not None:
-            # 2. C2PA raw 시그니처 탐지 (약한 흔적)
-            c2pa_raw_sigs, c2pa_raw_dec = _check_c2pa_signatures(raw_bytes, raw_lower)
+            # 2. C2PA raw 시그니처 탐지 (약한 흔적) — 스캔 영역(raw_lower) 사용
+            c2pa_raw_sigs, c2pa_raw_dec = _check_c2pa_signatures(raw_lower, raw_lower)
             signals.extend(c2pa_raw_sigs)
             if c2pa_raw_dec:
                 any_decisive = True
@@ -413,24 +469,27 @@ def inspect_metadata(image_path: str) -> Dict[str, Any]:
         elif skip_raw_scan:
             signals.append("raw byte scan skipped (file too large)")
 
-        # 5. optional: c2pa-python 정식 검증 (Python 3.10+ 환경)
-        c2pa_source, c2pa_dec = _try_c2pa_optional(image_path, signals)
-        if c2pa_dec:
-            any_decisive = True
+        # 5. optional: c2pa-python 정식 검증 — 경로 입력일 때만 (from_file API 필요)
+        if image_path is not None:
+            c2pa_result_source, c2pa_dec = _try_c2pa_optional(image_path, signals)
+            if c2pa_dec:
+                any_decisive = True
+        # bytes/file-like는 c2pa 정식 검증 skip (graceful)
 
         # 중복 신호 제거
         signals = list(dict.fromkeys(signals))
 
         # has_ai_signal은 결정적 신호가 있을 때만 True
         has_signal = any_decisive
+        final_source: Optional[str] = None
         if len(signals) > 0:
-            source = c2pa_source if c2pa_source else "metadata"
+            final_source = c2pa_result_source if c2pa_result_source else "metadata"
 
         return {
             "has_ai_signal": has_signal,
             "decisive": any_decisive,
             "signals": signals,
-            "source": source,
+            "source": final_source,
             "checked": True,
         }
 
